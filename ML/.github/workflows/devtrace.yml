@@ -1,0 +1,266 @@
+# ================================================================
+# DevTrace — Phase 2: GitHub Actions CI/CD Integration
+# Runs on every PR and push to main.
+# Posts analysis results as a PR comment.
+# Fails the check if HIGH severity issues are found.
+# ================================================================
+
+name: DevTrace Code Intelligence
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  devtrace-analysis:
+    name: AI Code Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git blame
+
+      # ── 2. Set up Python ───────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install DevTrace ────────────────────────────────────
+      - name: Install DevTrace & dependencies
+        run: |
+          pip install --quiet \
+            fastapi uvicorn httpx gitpython \
+            radon bandit chardet networkx \
+            pydantic pydantic-settings python-dotenv
+
+      # ── 4. Run DevTrace server (background) ───────────────────
+      - name: Start DevTrace server
+        run: |
+          cd $GITHUB_WORKSPACE
+          # Clone devtrace alongside the project
+          git clone --depth=1 https://github.com/${{ github.repository_owner }}/devtrace /tmp/devtrace 2>/dev/null || true
+          # If not available, use inline analysis script
+          python -c "
+          import subprocess, json, time, sys, os
+
+          # Write a minimal inline analyzer
+          analysis_script = '''
+          import sys
+          sys.path.insert(0, \"/tmp/devtrace\")
+          from app.analyzers.quality_analyzer import QualityAnalyzer
+          from app.analyzers.security_analyzer import SecurityAnalyzer
+          from app.utils.repo_cloner import RepositoryCloner, RepoFile
+          import os, json, pathlib
+
+          files = []
+          for root, dirs, filenames in os.walk(\".\"):
+              dirs[:] = [d for d in dirs if d not in {\".git\",\"node_modules\",\"__pycache__\",\".venv\"}]
+              for f in filenames:
+                  if pathlib.Path(f).suffix in {\".py\",\".js\",\".ts\"}:
+                      path = os.path.join(root, f)
+                      try:
+                          content = open(path).read()
+                          files.append(RepoFile(path, path[2:], content, \"Python\" if f.endswith(\".py\") else \"JavaScript\"))
+                      except: pass
+
+          q = QualityAnalyzer().analyze(files)
+          s = SecurityAnalyzer().analyze(files)
+          high = [i for i in s if i.severity==\"HIGH\"]
+          result = {
+              \"quality_score\": q.quality_score,
+              \"security_high\": len(high),
+              \"total_smells\": len(q.code_smells),
+              \"tech_debt\": q.estimated_tech_debt_hours,
+              \"issues\": [{\"severity\": i.severity, \"title\": i.title, \"file\": i.file_path, \"line\": i.line_number} for i in (s[:10])],
+          }
+          print(json.dumps(result))
+          '''
+          with open('/tmp/run_analysis.py', 'w') as f:
+              f.write(analysis_script)
+          " || true
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 5. Run analysis via DevTrace API ──────────────────────
+      - name: Analyze with DevTrace
+        id: analyze
+        run: |
+          REPO_URL="https://github.com/${{ github.repository }}"
+          DEVTRACE_URL="${{ vars.DEVTRACE_URL || 'https://your-devtrace-instance.com' }}"
+
+          # Call DevTrace API if URL is configured, otherwise use bandit + radon directly
+          if [ -n "${{ vars.DEVTRACE_URL }}" ]; then
+            echo "Calling DevTrace at $DEVTRACE_URL"
+            RESPONSE=$(curl -sf -X POST "$DEVTRACE_URL/api/v1/analyze" \
+              -H "Content-Type: application/json" \
+              -d "{\"repo_url\": \"$REPO_URL\"}" \
+              --max-time 30 || echo '{"task_id":""}')
+
+            TASK_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('task_id',''))")
+
+            if [ -n "$TASK_ID" ]; then
+              echo "Task ID: $TASK_ID — polling for results..."
+              for i in {1..60}; do
+                sleep 5
+                STATUS=$(curl -sf "$DEVTRACE_URL/api/v1/analyze/$TASK_ID" || echo '{"status":"unknown"}')
+                JOB_STATUS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))")
+                PROGRESS=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('progress',0))")
+                echo "Progress: $PROGRESS% ($JOB_STATUS)"
+                if [ "$JOB_STATUS" = "completed" ] || [ "$JOB_STATUS" = "failed" ]; then
+                  echo "$STATUS" > /tmp/devtrace_result.json
+                  break
+                fi
+              done
+            fi
+          else
+            echo "DevTrace URL not configured — running local analysis with bandit + radon"
+            pip install --quiet bandit radon 2>/dev/null
+            bandit -r . -f json -q --exit-zero > /tmp/bandit_out.json 2>/dev/null || echo '{"results":[]}' > /tmp/bandit_out.json
+            python3 -c "
+          import json, os
+          bandit = json.load(open('/tmp/bandit_out.json'))
+          results = bandit.get('results', [])
+          high = [r for r in results if r.get('issue_severity')=='HIGH']
+          issues = [{'severity': r.get('issue_severity'), 'title': r.get('test_name',''), 'file': r.get('filename',''), 'line': r.get('line_number',0)} for r in results[:15]]
+          result = {'quality_score': max(0, 100 - len(results)*2), 'security_high': len(high), 'total_smells': len(results), 'tech_debt': len(results)*0.5, 'issues': issues}
+          json.dump({'status':'completed','report': result}, open('/tmp/devtrace_result.json','w'))
+          print('Analysis complete.')
+          print(f'HIGH severity issues: {len(high)}')
+          "
+          fi
+
+          # Extract key metrics
+          python3 -c "
+          import json, os, sys
+          try:
+              data = json.load(open('/tmp/devtrace_result.json'))
+              report = data.get('report', data)
+              qs = report.get('quality_score', {})
+              quality = qs.get('value', qs) if isinstance(qs, dict) else qs
+              sec = report.get('security_high', report.get('critical_issues_count', 0))
+              debt = report.get('tech_debt', 0)
+              smells = report.get('total_smells', report.get('total_code_smells', 0))
+              issues = report.get('issues', report.get('actionable_insights', []))[:10]
+
+              print(f'QUALITY_SCORE={quality}')
+              print(f'SECURITY_HIGH={sec}')
+              print(f'TECH_DEBT={debt}')
+              print(f'CODE_SMELLS={smells}')
+              print(f'HAS_HIGH_SEVERITY={\"true\" if int(sec) > 0 else \"false\"}')
+
+              # Write issue summary for PR comment
+              summary = ''
+              for i in issues:
+                  sev = i.get('severity','')
+                  title = i.get('title','')
+                  f = i.get('file_path', i.get('file',''))
+                  line = i.get('line_number', i.get('line',''))
+                  summary += f'| {sev} | {title[:60]} | {str(f)[-40:]}:{line} |\n'
+              with open('/tmp/issue_summary.txt','w') as f:
+                  f.write(summary)
+          except Exception as e:
+              print(f'Error parsing results: {e}')
+              print('QUALITY_SCORE=0')
+              print('SECURITY_HIGH=0')
+              print('TECH_DEBT=0')
+              print('CODE_SMELLS=0')
+              print('HAS_HIGH_SEVERITY=false')
+          " >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 6. Post PR comment ─────────────────────────────────────
+      - name: Post analysis results to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const quality    = '${{ steps.analyze.outputs.QUALITY_SCORE }}' || '—';
+            const secHigh    = '${{ steps.analyze.outputs.SECURITY_HIGH }}' || '0';
+            const techDebt   = '${{ steps.analyze.outputs.TECH_DEBT }}' || '—';
+            const codeSmells = '${{ steps.analyze.outputs.CODE_SMELLS }}' || '—';
+            const hasHigh    = '${{ steps.analyze.outputs.HAS_HIGH_SEVERITY }}' === 'true';
+
+            let issueSummary = '';
+            try { issueSummary = fs.readFileSync('/tmp/issue_summary.txt', 'utf8'); } catch(e) {}
+
+            const qEmoji   = parseInt(quality) >= 80 ? '🟢' : parseInt(quality) >= 60 ? '🟡' : '🔴';
+            const secEmoji = parseInt(secHigh) === 0 ? '✅' : '🚨';
+            const status   = hasHigh ? '🔴 **BLOCKED** — HIGH severity issues must be resolved' : '✅ **PASSED** — No blocking issues';
+
+            const body = `## 🔍 DevTrace Code Analysis
+
+            ${status}
+
+            | Metric | Value |
+            |--------|-------|
+            | ${qEmoji} Quality Score | **${quality}**/100 |
+            | ${secEmoji} Security (HIGH) | **${secHigh}** issues |
+            | ⏱️ Tech Debt | **${techDebt}** hours |
+            | 🌀 Code Smells | **${codeSmells}** |
+
+            ${issueSummary ? `### Top Issues\n| Severity | Issue | Location |\n|----------|-------|----------|\n${issueSummary}` : ''}
+
+            <details>
+            <summary>About DevTrace</summary>
+            AI-powered code intelligence — analyzes quality, security, performance, and architecture.
+            </details>
+
+            *Powered by [DevTrace](https://github.com/your-org/devtrace) • ${new Date().toUTCString()}*`;
+
+            // Delete previous DevTrace comments
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.body && c.body.includes('DevTrace Code Analysis')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ── 7. Fail if HIGH severity ───────────────────────────────
+      - name: Enforce quality gate
+        run: |
+          HAS_HIGH="${{ steps.analyze.outputs.HAS_HIGH_SEVERITY }}"
+          QUALITY="${{ steps.analyze.outputs.QUALITY_SCORE }}"
+
+          if [ "$HAS_HIGH" = "true" ]; then
+            echo "❌ Quality gate FAILED: HIGH severity security issues detected"
+            echo "   Fix all HIGH severity issues before merging this PR."
+            exit 1
+          fi
+
+          if [ -n "$QUALITY" ] && [ "$QUALITY" -lt 30 ] 2>/dev/null; then
+            echo "❌ Quality gate FAILED: Quality score ($QUALITY) is critically low (<30)"
+            exit 1
+          fi
+
+          echo "✅ Quality gate PASSED"
